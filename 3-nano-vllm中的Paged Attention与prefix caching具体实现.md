@@ -118,11 +118,47 @@ Block Table:    [batch, max_blocks_per_seq]  # int，存物理块 ID （block_id
 
 ## 方案 C：Prefix Caching（在 Paged 的基础上，增加共享前缀）
 
-在 BlockManager 上加 Hash / Radix：相同前缀（如 system prompt）的多个请求 **指向同一物理块**（引用计数 + 只读共享），显存零拷贝复用。  
-→ 依赖方案 B 的「块级映射」；连续 Naive 很难做干净。（注意，）
+在 BlockManager 上加 Hash：相同前缀（如 system prompt）的多个请求 **指向同一物理块**（引用计数 + 只读共享），显存零拷贝复用。  
+→ 依赖方案 B 的「块级映射」；连续 Naive 很难做干净。
 
-至于怎么共享，其实逻辑也很直觉：前缀的数个token做hash，如果has码对上了而且token内容也都对上了，那就共享这段前缀token对应的KV cache。
-注意，这个所谓的共享，是跨sequence（请求）共享
+共享是 **跨 sequence（请求）** 的：A 算过的前缀满块，B 来了可以挂到同一物理格，不必重算、不必再拷一份 KV。
+
+### 上层逻辑：靠什么认出「同一段前缀」？
+
+不是把整段 prompt 随便 hash 一下就完事。nano-vllm 的规则是：
+
+```text
+1. 只给「满块」做指纹；末块没写满 → 不登记、不能当 prefix 命中
+2. 每个满块各自一个 hash，表里一块一条：
+     hash_to_block_id[本块hash] = 物理 block_id
+3. 算第 i 块时是链式的：
+     新建 xxhash → 先喂「上一块 hash 的 8 字节」→ 再喂「本块 token 的原始字节」→ 得到本块 hash
+     （块0 没有上一块，只喂本块 token）
+4. 新请求从逻辑段 0 起同样算一遍，查表；连续命中几块就共享几块，一旦某块对不上就停
+```
+
+「连起来」指的是：**算某一个块的 hash 时，把「上一块指纹字节」和「本块 token 字节」接成一条字节流再摘要**——不是数字相加，也不是把请求里所有满块 token 拼成一大串只留一个总 hash。
+
+具体例子（`block_size=4`，hash 数值是假的，只看流程）：
+
+```text
+某请求 token： [10, 20, 30, 40,  50, 60, 70, 80,  90]
+                └─ 满块0 ─┘  └─ 满块1 ─┘  └未满┘
+
+① 块0：xxhash( [10,20,30,40] 的字节 ) → hash0=111
+   登记：111 → 物理格A
+
+② 块1：xxhash( [111 的 8 字节] 再接 [50,60,70,80] 的字节 ) → hash1=222
+   登记：222 → 物理格B
+   （表里现在有两条，不是一条总指纹）
+
+③ [90] 未满 → 不登记
+
+另一请求前 8 个也是 10..80：照样算出 111、222 → 命中格A、格B，block_table 前两项直接挂这两格。
+若只有后 4 个碰巧一样、前 4 个不同：hash0 就不是 111，块1 掺进去的前缀字节变了，得不到 222 → 不会误共享格B。
+```
+
+链式的目的：后一块指纹绑着前缀路径 → **只能共享从序列开头连续相同的满块**，不会出现「中间某块碰巧一样就拿来复用」。
 
 ```text
 A、B 共享同一段 system prompt（占满物理块 7），后半段各自生成：
@@ -138,6 +174,8 @@ A、B 共享同一段 system prompt（占满物理块 7），后半段各自生�
 
 Naive 对比：A、B 各有一份完整连续 KV，前缀在显存里出现两次。
 ```
+
+源码级细节（`compute_hash` / `hash_blocks` / `can_allocate`）见后文 BlockManager 与 `postprocess` 各节。
 
 ## Paged 具体缓解什么？
 
@@ -559,6 +597,8 @@ if not self.enforce_eager:
 
 挂接之后，每层 Attention 的 `k_cache` / `v_cache` 形状为  
 `[num_kvcache_blocks, block_size, num_kv_heads, head_dim]`，与后面 `slot = block_id * block_size + offset` 的线性下标一致（kernel 里按 `slot * D` 写）。
+
+> 一层总槽 = `N × block_size`（全请求共用）。nano 开池只 `assert N > 0`，**不**校验能否撑满 `max_model_len`；与 vLLM 的差别、以及「单请求超过整池」时会怎样，见文末 **彩蛋：池子装不下时**。
 
 ### 这段 `layer_id` 循环在干什么？
 
@@ -1632,12 +1672,34 @@ def allocate(self, seq: Sequence, num_cached_blocks: int):
 1. **名字就叫 Prefix Caching**：共享的是 system prompt 等**从第一段开始相同**的内容，不是序列中间某段碰巧一样。
 2. **`num_cached_blocks` 的定义就是「从头连续命中了几块」**  
    `can_allocate` 从 `i=0` 扫起，一旦某块 miss 就 `break`，返回的是前缀长度。不会出现「第 0 段 miss、第 2 段却算命中」。
-3. **hash 是链式的**，后一块指纹绑着前一块：
+3. **hash 是链式的**，后一块指纹绑着前一块——**不是**把所有满块 token 拼成一大串只算一次：
 
 ```python
+def compute_hash(token_ids, prefix=-1):
+    h = xxhash.xxh64()
+    if prefix != -1:
+        h.update(prefix.to_bytes(8, "little"))  # 先掺入「上一块的 hash 值」
+    h.update(np.array(token_ids).tobytes())     # 再掺入「本块的 token ids」
+    return h.intdigest()                        # → 本块自己的指纹
+
+# 登记/查询时按逻辑段逐块推进：
 h = -1
-h = compute_hash(block0_tokens, h)   # 只含段0
-h = compute_hash(block1_tokens, h)   # 含「段0+段1」整段前缀
+h = compute_hash(block0_tokens, h)   # 块0：只含段0 的 token；写入 hash_to_block_id[h]=物理格
+h = compute_hash(block1_tokens, h)   # 块1：本块 token + 块0 的 hash；另有一个独立表项
+# 表里有多条记录，一块一个 hash，不是整请求一个 hash
+```
+
+```text
+错误理解：把请求里所有满块的 token 拼成一大串 → 整请求只算 1 个总 hash
+实际做法：每个满块各自 1 个 hash；算第 i 块时，把「上一块 hash 的 8 字节」和「本块 token 字节」接成一条字节流再 xxhash
+
+所以「连起来」对不对？
+  · 对「一次 compute_hash 内部」：对，就是字节流前后相接再摘要（不是数字相加）
+  · 对「整请求」：不对，表里仍是一块一条记录，不是所有满块共用一个总指纹
+
+为何链式（掺上一块 hash 的字节）？
+  块1 的指纹会随块0 的指纹变 → 查到块1 命中，隐含块0 也必须相同
+  所以 prefix 只能从序列开头连续命中，不会出现「中间某块碰巧一样就共享」
 ```
 
 所以查表命中「段1 的 hash」时，语义上已经要求段0 也相同。中缀/后缀单独匹配，这套表做不到，也不打算做。
@@ -3311,8 +3373,59 @@ def hash_blocks(self, seq: Sequence):
     start = seq.num_cached_tokens // self.block_size
     end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
     if start == end: return                  # 本轮没有新满块（例如只写了末块 3 个 token）
-    ...  # 对 [start, end) 算链式 hash，写入 hash_to_block_id
+    # 链式种子：若前面已有满块，接着上一块的 hash；否则 -1
+    h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+    for i in range(start, end):              # 只处理本轮新满的那些逻辑段
+        block = self.blocks[seq.block_table[i]]
+        token_ids = seq.block(i)             # 仅这一块的 token（长度=block_size）
+        h = self.compute_hash(token_ids, h)  # 本块 token + 上一块 hash → 本块指纹
+        block.update(h, token_ids)           # 卡片上记下 hash 与 token 列表（防碰撞复核）
+        self.hash_to_block_id[h] = block.block_id
 ```
+
+不是「把本请求所有满块拼起来算一个总 hash」，而是：
+
+```text
+对本轮新满的每一块 i：
+  # ‖ = 字节串接（不是代码运算符）；实现上是两次 update：
+  #   h.update(上一块 hash 的 8 字节)；h.update(本块 token_ids 的字节)
+  hash_i = hash( 上一块的 hash_{i-1}  ‖  本块 token_ids )
+  登记：hash_to_block_id[hash_i] = 该块物理号
+
+未满的末块：不进这个循环，不登记。
+```
+
+**具体例子**（`block_size=4`，数字是假的 hash，只为看清流程）：
+
+```text
+请求 token： [10, 20, 30, 40,  50, 60, 70, 80,  90]
+              └─ 满块0 ─┘  └─ 满块1 ─┘  └未满┘
+
+① 算 / 登记块0（没有上一块，prefix=-1）
+   喂给 xxhash 的字节流 = 仅 [10,20,30,40] 的原始字节
+   得到 hash0，假设 = 111
+   登记：hash_to_block_id[111] = 物理格A
+   （表里第 1 条）
+
+② 算 / 登记块1（prefix=hash0=111）
+   喂给 xxhash 的字节流 =
+        [ 111 的 8 个字节 ] 再接上 [50,60,70,80] 的原始字节
+   得到 hash1，假设 = 222
+   登记：hash_to_block_id[222] = 物理格B
+   （表里第 2 条；111 那条还在）
+
+③ 末块 [90] 未满 → 不算、不登记
+
+表里最终是：
+  111 → 格A     # 「前缀 = 块0 那 4 个 token」
+  222 → 格B     # 「前缀 = 块0+块1 那 8 个 token」（因为算 222 时掺了 111）
+
+不是：
+  把 [10..80] 八个 token 拼成一大串 → 只得到一个总 hash → 表里只有一条
+```
+
+以后另一个请求前 8 个也是 `10..80`：从块0 起同样算出 111、222，查表命中格A、格B。  
+若只有块1 的 `[50..80]` 碰巧一样、块0 不同 → 先算出的 hash0 就不是 111，再算块1 时掺进去的前缀字节变了，得不到 222，不会误命中格B。
 
 本轮在 `+=` **之前**调用：`start=0, end=(0+7)//4=1` → 只给满块逻辑段 0（物理 `block_table[0]=0`）登记 hash。末块未满，不登记。
 
@@ -3658,3 +3771,153 @@ prepare_block_tables：把各 seq 的表 pad 成 [batch, max_blocks] 的 GPU ten
 §1：开货架（kv_cache）+ 建登记本（BlockManager，全空闲）
 §2：登记本上借号写进 block_table → prepare_* 把号译成 slot → Attention 按 slot 写、按表读 → 结束还号
 ```
+
+---
+
+# 彩蛋：池子装不下时（nano-vllm vs vLLM）
+
+主线读完再看。这里回答三个容易绕晕的问题：
+
+1. 一层只有 `N × block_size` 个 token 槽——单请求超过整池怎么办？  
+2. 「大不了不缓存继续生成」在 full attention 下成立吗？  
+3. nano 和 vLLM 启动时到底各自 assert / raise 了什么？撞墙后会不会死循环？
+
+## 1. 物理上限先钉死
+
+```text
+一层 K（或 V）池：形状 [N, block_size, ...]
+→ 总槽位 = N × block_size（所有并发请求共用，不是每请求一份）
+
+单请求要存「全量历史 KV」时：
+  上限 ≤ min(max_model_len, 它能租到的块数 × block_size)
+  若它独占整池：最长也不能超过 N × block_size
+```
+
+- **preempt 只是腾挪**：把别人占的块还回 `free`，**总槽数不变**。  
+- 单请求已经需要第 `N×block_size+1` 个槽 → 踢谁都没用，第 N+1 格根本不存在。  
+- full attention 下也不能「不缓存硬扛」：不存 K/V = 每步重算全部历史，等于退回无 cache 时代。  
+  真要丢旧 KV，得是 sliding window 等**模型本身不看那么远**的架构。
+
+工程上只能：加显存 / 提高 `gpu_memory_utilization`、减小 `max_model_len`、降并发，或换架构。
+
+## 2. 启动校验：nano vs vLLM
+
+两边都是「剩多少显存开多少块」；差别在开完之后查不查 `max_model_len`。
+
+**nano-vllm**（`model_runner.allocate_kv_cache`）：
+
+```python
+config.num_kvcache_blocks = int(...显存预算...) // block_bytes
+assert config.num_kvcache_blocks > 0          # 只保证 ≥1 个 block
+# 没有：N * block_size >= max_model_len
+```
+
+`config.max_model_len` 只会 `min` 到 `max_position_embeddings`，**从不和 N 对齐**。  
+配置写 4096、池子实际更短 → 启动仍可能成功。
+
+**vLLM**（如 v0.9.2 `worker.initialize_cache` → `raise_if_cache_size_invalid`）：
+
+```python
+if num_gpu_blocks <= 0:
+    raise ValueError("No available memory for the cache blocks. ...")
+
+max_seq_len = block_size * (num_gpu_blocks // pipeline_parallel_size)
+if max_model_len > max_seq_len:
+    raise ValueError(
+        f"max seq len ({max_model_len}) > KV cache capacity ({max_seq_len}). "
+        "Try increasing gpu_memory_utilization or decreasing max_model_len ..."
+    )
+```
+
+| 检查 | nano-vllm | vLLM |
+|------|-----------|------|
+| 块数 > 0 | `assert` | `ValueError` |
+| `max_model_len ≤ 池子能存的 token 数` | **无** | **有**（启动失败） |
+| 显存不够撑配置长度 | 可能带着虚高的 `max_model_len` 跑起来 | 启动就拦下 |
+| 失败形态 | `AssertionError`（往往无文案） | 明确提示改配置 |
+
+vLLM 额外保证：**至少能放下一条长度为 `max_model_len` 的全量 KV**。  
+多请求并发抢块时的 preempt，是另一类问题（池够单条、不够大家一起）。
+
+## 3. nano 撞墙模拟：不是死循环，是 assert 崩
+
+`scheduler.schedule` decode 末尾：
+
+```python
+assert scheduled_seqs   # 空列表 → False → AssertionError（无自定义消息）
+```
+
+### 设定
+
+```text
+block_size = 4
+num_kvcache_blocks = 50
+→ 一层总槽 = 200
+
+A 已 len=201（下标 0..200），本步要 store last_token（下标 200）
+→ 需要第 51 个物理块，池子只有 50
+→ can_append：201%4==1 且 free=0 → False
+```
+
+```text
+waiting:  []
+running:  [ A ]
+free:     []
+A.block_table: 50 格占满
+scheduled_seqs: []
+```
+
+### `schedule()` 逐步
+
+```text
+┌─ schedule() ─────────────────────────────────────────┐
+│ ① prefill：waiting 空 → 跳过                         │
+│                                                      │
+│ ② decode：                                           │
+│    popleft → seq=A，running=[]                       │
+│                                                      │
+│    can_append(A)?  False（要新块，free=0）           │
+│                                                      │
+│    while not can_append:                             │
+│      running 空 → preempt(A)                         │
+│        deallocate：50 块回 free                      │
+│        A → waiting，is_prefill=True                  │
+│      break  ← 不进 while-else                        │
+│                                                      │
+│    scheduled_seqs 仍 []                              │
+│                                                      │
+│    assert scheduled_seqs                             │
+│      bool([]) == False                               │
+│      → AssertionError  ✖                             │
+│                                                      │
+│    # extendleft / return 执行不到                    │
+└──────────────────────────────────────────────────────┘
+```
+
+```text
+running:[A] ──popleft──► 要新块且 free=0
+                              │
+                              ▼
+                         preempt(自己)
+                         waiting:[A]，free 满了
+                         scheduled=[]
+                              │
+                              ▼
+                    assert scheduled_seqs ✖
+                    （不是死循环）
+```
+
+### 若假想删掉这行 assert
+
+```text
+return [], False
+→ step「空跑」
+→ waiting 仍有 A → is_finished=False
+→ 再 schedule：
+    can_allocate 要 51 块，free 只有 50 → -1
+    decode running 空 → 又空列表
+→ 真·空转死循环（A 永远 FINISH 不了）
+```
+
+所以现有 `assert scheduled_seqs` 的作用：把「排不出任何人」打成**立刻崩溃**，而不是静默卡死。  
+nano 没有 vLLM 那种启动期对齐，也没有友好的「请求永远装不下」拒绝文案——这是小项目的糙边；**「整池存不下单条全量 KV」本身是显存物理墙，两边都变不出第 201 格。**
